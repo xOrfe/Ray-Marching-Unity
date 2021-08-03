@@ -1,0 +1,329 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+Texture2D<float4> inTexture;
+RWTexture2D<float4>  outTexture;
+
+float4x4 cameraToWorldMatrix;
+float4x4 cameraInverseProjection;
+
+float3 lightDir;
+float lightStrength;
+float iTime;
+
+static const float maxDistance = 500;
+static const float epsilon = 0.00035f;
+static const float shadowBias = epsilon * 50;
+static const float PI = 3.141592653589793238;
+
+struct Renderable {
+    float3 localPosition;
+    float3 localScale;
+    float3 localColor;
+    
+    int type;
+    int operation;
+    
+    float blendStrength;
+    
+    int childCount;
+};
+
+StructuredBuffer<Renderable> renderables;
+int renderableCount;
+
+struct Ray {
+    float3 origin;
+    float3 dir;
+};
+Ray GetRay(float3 origin, float3 dir)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.dir = dir;
+    return ray;
+}
+float2x2 Rotate (float angle) {
+    float s = sin (angle);
+    float c = cos (angle);
+
+    return float2x2 (c, -s, s, c);
+}
+float4 Blend( float a, float b, float3 colA, float3 colB, float k )
+{
+    float h = clamp( 0.5+0.5*(b-a)/k, 0.0, 1.0 );
+    float blendDst = lerp( b, a, h ) - k*h*(1.0-h);
+    float3 blendCol = lerp(colB,colA,h);
+    return float4(blendCol, blendDst);
+}
+
+float4 Combine(float distance1, float distance2, float3 color1, float3 color2, int operation, float blendStrength) {
+    float baseDistance = distance1;
+    float3 baseColor = color1;
+
+    switch (operation)
+    {
+        case 0:
+            if (distance2 < distance1) {
+                baseDistance = distance2;
+                baseColor = color2;
+            }
+            break;
+        case 1:
+            float4 blend = Blend(distance1,distance2,color1,color2, blendStrength);
+            baseDistance = blend.w;
+            baseColor = blend.xyz;
+            break;
+        case 2:
+            if (-distance2 > baseDistance) {
+                baseDistance = -distance2;
+                baseColor = color2;
+            }
+            break;
+        case 3:
+            if (distance2 > baseDistance) {
+                baseDistance = distance2;
+                baseColor = color2;
+            }
+            break;
+    }
+    return float4(baseColor,baseDistance);
+}
+
+float SphereSDF(float3 lookBase, float3 renderableBase, float radius) {
+    return distance(lookBase, renderableBase) - radius;
+}
+float DE(float3 lookBase, float3 renderableBase, float radius)
+{
+    float3 a1 = float3(1,1,1)* radius;
+    float3 a2 = float3(-1,-1,1)* radius;
+    float3 a3 = float3(1,-1,-1)* radius;
+    float3 a4 = float3(-1,1,-1)* radius;
+    float3 c;
+    int n = 0;
+    float dist, d;
+    while (n < 50) {
+        c = a1; dist = length(lookBase-a1);
+        d = length(lookBase-a2); if (d < dist) { c = a2; dist=d; }
+        d = length(lookBase-a3); if (d < dist) { c = a3; dist=d; }
+        d = length(lookBase-a4); if (d < dist) { c = a4; dist=d; }
+        lookBase = 2*lookBase-c*(2-1.0);
+        n++;
+    }
+
+    return length(lookBase) * pow(2, float(-n));
+}
+float map(float value, float min1, float max1, float min2, float max2)
+{
+    float perc = (value - min1) / (max1 - min1);
+
+    // Do the same operation backwards with min2 and max2
+    return  perc * (max2 - min2) + min2;
+}
+float mandelbulb (float3 position) {
+    
+    float3 z = position;
+    float dr = 1.0;
+    float r = 0.0;
+    int iterations = 0;
+    float power = 8.0 + (5.0 * map (sin (iTime * PI / 10.0 + PI), -1.0, 1.0, 0.0, 1.0));
+
+    for (int i = 0; i < 10; i++) {
+        iterations = i;
+        r = length (z);
+
+        if (r > 2.0) {
+            break;
+        }
+
+        // convert to polar coordinates
+        float theta = acos (z.z / r);
+        float phi = atan (z.y/ z.x);
+        dr = pow (r, power - 1.0) * power * dr + 1.0;
+
+        // scale and rotate the point
+        float zr = pow (r, power);
+        theta = theta * power;
+        phi = phi * power;
+
+        // convert back to cartesian coordinates
+        z = zr * float3 (sin (theta) * cos (phi), sin (phi) * sin (theta), cos (theta));
+        z += position;
+    }
+    float dst = 0.5 * log (r) * r / dr;
+    return dst;
+}
+
+// Calculates de distance from a position p to the scene
+float DistanceEstimator (float3 p) {
+    //p.yz *= Rotate (-0.3 * PI);
+    float mandelb = mandelbulb (p);
+    return mandelb;
+}
+
+float GetRenderableDistance(Renderable renderable, float3 base) {
+    switch (renderable.type)
+    {
+        case 0:
+            return SphereSDF(base, renderable.localPosition, renderable.localScale.x);
+        case 1:
+            return DE(base, renderable.localPosition, renderable.localScale.x);
+        case 2:
+            return DistanceEstimator(base);
+        default: return SphereSDF(base, renderable.localPosition, renderable.localScale.x);
+    }
+}
+
+float3 GetNormal(float3 p)
+{
+    float3 f = float3(1,1,1);
+    return f;
+}
+
+float4 SceneInfo(float3 eye) {
+    float globalDst = maxDistance;
+    float3 globalColor = 0;
+
+    for (int i = 0; i < renderableCount; i ++) {
+        Renderable renderable = renderables[i];
+        int childCount = renderable.childCount;
+
+        float localDst = GetRenderableDistance(renderable,eye);
+        float3 localColor = renderable.localColor;
+
+
+        for (int j = 0; j < childCount; j ++) {
+            Renderable childShape = renderables[i+j+1];
+            float childDistance = GetRenderableDistance(childShape,eye);
+
+            float4 combined = Combine(localDst, childDistance, localColor, childShape.localColor, childShape.operation, childShape.blendStrength);
+            localColor = combined.xyz;
+            localDst = combined.w;
+        }
+        i+=childCount; // skip over children in outer loop
+        
+        float4 globalCombined = Combine(globalDst, localDst, globalColor, localColor, renderable.operation, renderable.blendStrength);
+        globalColor = globalCombined.xyz;
+        globalDst = globalCombined.w;        
+    }
+
+    return float4(globalColor, globalDst);
+}
+float GetShadow(Ray ray, float dstToShadePoint) {
+    float rayDst = 0;
+    int marchSteps = 0;
+    float shadowIntensity = .2;
+    float brightness = 1;
+
+    while (rayDst < dstToShadePoint) {
+        marchSteps ++;
+        float4 sceneInfo = SceneInfo(ray.origin);
+        float dst = sceneInfo.w;
+        
+        if (dst <= epsilon) {
+            return shadowIntensity;
+        }
+
+        brightness = min(brightness,dst*200);
+
+        ray.origin += ray.dir * dst;
+        rayDst += dst;
+    }
+    return shadowIntensity + (1-shadowIntensity) * brightness;
+}
+float3 getNormal(float3 lookBase)
+{
+    const float e = 0.0001;
+    const float3 dx = float3(e, 0, 0);
+    const float3 dy = float3(0, e, 0);
+    const float3 dz = float3(0, 0, e);
+
+    float d = GetRenderableDistance(renderables[0],lookBase);
+
+    return normalize(float3(
+        d - GetRenderableDistance(renderables[0],float3(lookBase - dx)),
+        d - GetRenderableDistance(renderables[0],float3(lookBase - dy)),
+        d - GetRenderableDistance(renderables[0],float3(lookBase - dz))
+    ));
+}
+float4 generateAmbientOcclusion(float3 lookBase, float3 lookDir)
+{
+    float4 totao = float4(0.0,0.0,0.0,0.0);
+    float sca = 1.0;
+
+    for (int aoi = 0; aoi < 5; aoi++)
+    {
+        float hr = 0.01 + 0.02 * float(aoi * aoi);
+        float3 aopos = lookBase + lookDir * hr;
+        float dd = GetRenderableDistance(renderables[0],lookBase);
+        float ao = clamp(-(dd - hr), 0.0, 1.0);
+        totao += ao * sca * float4(1.0, 1.0, 1.0, 1.0);
+        sca *= 0.75;
+    }
+
+    const float aoCoef = 0.5;
+    totao.w = 1.0 - clamp(aoCoef * totao.w, 0.0, 1.0);
+
+    return totao;
+}
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width,height;
+    outTexture.GetDimensions(width, height);
+
+    outTexture[id.xy] = inTexture[id.xy];
+
+    float2 currPixelCoord = id.xy / float2(width,height) * 2 - 1;
+    float rayDistace = 0;
+    
+    float3 origin = mul(cameraToWorldMatrix, float4(0,0,0,1)).xyz;
+    float3 dir = mul(cameraInverseProjection, float4(currPixelCoord,0,1)).xyz;
+    dir = normalize(mul(cameraToWorldMatrix, float4(dir,0)).xyz);
+    Ray ray = GetRay(origin,dir);
+    
+    int marchSteps = 0;
+
+    while (rayDistace < maxDistance) {
+        marchSteps ++;
+        float4 sceneInfo = SceneInfo(ray.origin);
+        float dst = sceneInfo.w;
+        
+        if (dst <= epsilon) {
+            float3 pointOnSurface = ray.origin + ray.dir * dst;
+            float3 normal = GetNormal(pointOnSurface - ray.dir * epsilon);
+            float3 lightDir2 = normalize(lightDir-ray.origin);
+            float lighting = saturate(saturate(dot(normal,lightDir)));
+            float3 col = sceneInfo.xyz;
+            float diff = dot(GetNormal(ray.origin), lightDir2);
+            
+            // Shadow
+            float3 offsetPos = pointOnSurface + normal * shadowBias;
+            float3 dirToLight = normalize(lightDir- offsetPos);
+
+            ray.origin = offsetPos;
+            ray.dir = dirToLight;
+
+            float dstToLight = distance(offsetPos,lightDir);
+            float shadow = GetShadow(ray, dstToLight);
+            float4 ao = generateAmbientOcclusion(ray.origin + GetNormal(ray.origin) * 0.0001, ray.dir);
+            float u = 1.0 - floor(fmod (ray.origin.x, 2.0));
+            float v = 1.0 - floor(fmod (ray.origin.z, 2.0));
+            if ((u == 1.0 && v < 1.0) || (v == 1.0 && u < 1.0))
+            {
+                diff *= 0.7;
+            }
+
+            
+            col -= ao.xyz * ao.w;
+            outTexture[id.xy] = float4(col *lighting* max(0.5, shadow), 1.0) * exp(-rayDistace * 0.12);
+
+            break;
+        }
+
+        ray.origin += ray.dir * dst;
+        rayDistace += dst;
+    }
+}
